@@ -1,8 +1,12 @@
 streamlit
-earthengine-api
-folium
 streamlit-folium
+folium
 geopandas
 shapely
 pandas
+numpy
 plotly
+rasterio
+pystac-client
+planetary-computer
+pyproj
