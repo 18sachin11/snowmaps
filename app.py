@@ -15,9 +15,10 @@
 #   6. Generate NDSI histogram
 #   7. Derive snow threshold using Otsu or manual threshold
 #   8. Calculate snow area
-#   9. Export NDSI GeoTIFF, snow mask GeoTIFF, snow polygons SHP
+#   9. Preview Landsat composites: NCC, FCC, SWIR, Snow/Ice, etc.
+#   10. Export NDSI GeoTIFF, snow mask GeoTIFF, snow polygons SHP
 #
-# Author: Open-source geospatial dashboard template
+# No Google Earth Engine is used.
 # ================================================================
 
 
@@ -27,13 +28,10 @@
 
 import os
 import re
-import io
-import json
 import math
 import zipfile
 import tempfile
 from pathlib import Path
-from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -77,7 +75,7 @@ st.markdown(
     """
     Please **draw your area of interest on the map** or **upload a shapefile/GeoJSON/GPKG**.
     The dashboard searches Landsat Collection 2 Level-2 imagery, computes NDSI, estimates snow cover,
-    and exports GeoTIFF and Shapefile outputs.
+    previews different Landsat composites, and exports GeoTIFF and shapefile outputs.
     """
 )
 
@@ -89,6 +87,7 @@ st.markdown(
 PLANETARY_COMPUTER_STAC = "https://planetarycomputer.microsoft.com/api/stac/v1"
 LANDSAT_COLLECTION = "landsat-c2-l2"
 
+# Landsat Collection 2 Level-2 optical surface reflectance scaling
 SURFACE_REFLECTANCE_SCALE = 0.0000275
 SURFACE_REFLECTANCE_OFFSET = -0.2
 
@@ -102,7 +101,43 @@ LANDSAT_PLATFORMS = {
 
 
 # ================================================================
-# 4. General utility functions
+# 4. Visualization recipes for Landsat composites
+# ================================================================
+
+VISUALIZATION_RECIPES = {
+    "NCC - Natural Colour (Red-Green-Blue)": {
+        "bands": ["red", "green", "blue"],
+        "description": "Natural colour view, similar to human vision."
+    },
+    "FCC - False Colour (NIR-Red-Green)": {
+        "bands": ["nir08", "red", "green"],
+        "description": "Vegetation appears bright red; useful for vegetation and land-cover interpretation."
+    },
+    "SWIR False Colour (SWIR1-NIR-Red)": {
+        "bands": ["swir16", "nir08", "red"],
+        "description": "Useful for snow, moisture, burn scars, and terrain contrast."
+    },
+    "Snow/Ice Composite (Green-SWIR1-NIR)": {
+        "bands": ["green", "swir16", "nir08"],
+        "description": "Useful for separating snow/ice from clouds and dark terrain."
+    },
+    "Vegetation Composite (NIR-SWIR1-Red)": {
+        "bands": ["nir08", "swir16", "red"],
+        "description": "Useful for vegetation condition and surface moisture interpretation."
+    },
+    "Geology Composite (SWIR2-SWIR1-Blue)": {
+        "bands": ["swir22", "swir16", "blue"],
+        "description": "Useful for lithological, bare-ground, and dry-surface contrast."
+    },
+    "Urban/Built-up Composite (SWIR2-NIR-Red)": {
+        "bands": ["swir22", "nir08", "red"],
+        "description": "Useful for built-up areas, exposed surfaces, and dry terrain."
+    }
+}
+
+
+# ================================================================
+# 5. General utility functions
 # ================================================================
 
 def safe_name(text: str) -> str:
@@ -135,7 +170,7 @@ def get_download_bytes(file_path: str):
 
 
 # ================================================================
-# 5. AOI functions
+# 6. AOI functions
 # ================================================================
 
 def read_uploaded_aoi(uploaded_file, simplify_tolerance: float = 0.0):
@@ -167,6 +202,7 @@ def read_uploaded_aoi(uploaded_file, simplify_tolerance: float = 0.0):
                 zip_ref.extractall(tmpdir)
 
             shp_files = []
+
             for root, _, files in os.walk(tmpdir):
                 for file in files:
                     if file.lower().endswith(".shp"):
@@ -199,7 +235,7 @@ def read_uploaded_aoi(uploaded_file, simplify_tolerance: float = 0.0):
     gdf = gdf[gdf.geometry.notnull()]
     gdf = gdf[~gdf.geometry.is_empty]
 
-    polygon_gdf = gdf[gdf.geometry.geom_type.isin(["Polygon", "MultiPolygon"])]
+    polygon_gdf = gdf[gdf.geometry.geom_type.isin(["Polygon", "MultiPolygon"])].copy()
 
     if polygon_gdf.empty:
         raise ValueError("AOI must contain Polygon or MultiPolygon geometry.")
@@ -341,7 +377,7 @@ def build_processing_grid(aoi_geojson, resolution_m):
 
 
 # ================================================================
-# 6. STAC search functions
+# 7. STAC search functions
 # ================================================================
 
 def search_landsat_items(
@@ -376,6 +412,7 @@ def search_landsat_items(
     ]
 
     filtered_items = []
+
     for item in items:
         platform = item.properties.get("platform", "")
         if platform in selected_platform_values:
@@ -412,7 +449,7 @@ def create_items_table(items):
 
 
 # ================================================================
-# 7. Raster reading and Landsat masking functions
+# 8. Raster reading and Landsat masking functions
 # ================================================================
 
 def read_cog_to_grid(
@@ -426,8 +463,7 @@ def read_cog_to_grid(
     """
     Read a remote Cloud Optimized GeoTIFF into the target grid.
 
-    This uses WarpedVRT so the source image is reprojected and aligned
-    to the dashboard processing grid.
+    WarpedVRT reprojects and aligns the source image to the dashboard grid.
     """
     rasterio_env = {
         "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
@@ -438,15 +474,18 @@ def read_cog_to_grid(
 
     with rasterio.Env(**rasterio_env):
         with rasterio.open(href) as src:
-            with WarpedVRT(
-                src,
-                crs=dst_crs,
-                transform=dst_transform,
-                width=width,
-                height=height,
-                resampling=resampling_method,
-                nodata=src.nodata
-            ) as vrt:
+            vrt_kwargs = {
+                "crs": dst_crs,
+                "transform": dst_transform,
+                "width": width,
+                "height": height,
+                "resampling": resampling_method
+            }
+
+            if src.nodata is not None:
+                vrt_kwargs["nodata"] = src.nodata
+
+            with WarpedVRT(src, **vrt_kwargs) as vrt:
                 arr = vrt.read(1, masked=False)
 
     return arr
@@ -488,7 +527,7 @@ def make_landsat_valid_mask(qa_pixel_array, mask_water=False):
 
 def scale_surface_reflectance(raw_array):
     """
-    Apply Landsat C2 L2 surface reflectance scale and offset.
+    Apply Landsat Collection 2 Level-2 surface reflectance scale and offset.
     """
     return raw_array.astype("float32") * SURFACE_REFLECTANCE_SCALE + SURFACE_REFLECTANCE_OFFSET
 
@@ -523,16 +562,25 @@ def process_single_landsat_item(
     width,
     height,
     aoi_mask,
-    mask_water=False,
-    read_rgb=True
+    mask_water=False
 ):
     """
-    Process one Landsat item:
-        - sign STAC item
-        - read green, swir16, qa_pixel
-        - compute valid mask
-        - compute NDSI
-        - optionally read RGB bands for preview
+    Process one Landsat item.
+
+    This function reads all key reflectance bands required for:
+        - NCC
+        - FCC
+        - SWIR composites
+        - Snow/Ice composite
+        - Vegetation composite
+        - Geology composite
+        - NDSI computation
+
+    Required assets:
+        green, swir16, qa_pixel
+
+    Optional visualization assets:
+        blue, red, nir08, swir22
     """
     signed_item = pc.sign(item)
 
@@ -541,24 +589,6 @@ def process_single_landsat_item(
     for asset in required_assets:
         if asset not in signed_item.assets:
             raise ValueError(f"Required asset '{asset}' not available in item {item.id}")
-
-    green_raw = read_cog_to_grid(
-        signed_item.assets["green"].href,
-        dst_crs,
-        dst_transform,
-        width,
-        height,
-        resampling_method=Resampling.bilinear
-    )
-
-    swir_raw = read_cog_to_grid(
-        signed_item.assets["swir16"].href,
-        dst_crs,
-        dst_transform,
-        width,
-        height,
-        resampling_method=Resampling.bilinear
-    )
 
     qa_raw = read_cog_to_grid(
         signed_item.assets["qa_pixel"].href,
@@ -574,46 +604,45 @@ def process_single_landsat_item(
         mask_water=mask_water
     )
 
-    valid_mask = valid_mask & aoi_mask & (green_raw != 0) & (swir_raw != 0)
+    bands_to_read = ["blue", "green", "red", "nir08", "swir16", "swir22"]
+    band_arrays = {}
 
-    green_ref = scale_surface_reflectance(green_raw)
-    swir_ref = scale_surface_reflectance(swir_raw)
+    for band_name in bands_to_read:
+        if band_name not in signed_item.assets:
+            band_arrays[band_name] = np.full(
+                (height, width),
+                np.nan,
+                dtype="float32"
+            )
+            continue
 
-    ndsi = compute_ndsi(
-        green_reflectance=green_ref,
-        swir1_reflectance=swir_ref,
-        valid_mask=valid_mask
+        raw_band = read_cog_to_grid(
+            signed_item.assets[band_name].href,
+            dst_crs,
+            dst_transform,
+            width,
+            height,
+            resampling_method=Resampling.bilinear
+        )
+
+        scaled_band = scale_surface_reflectance(raw_band)
+        band_arrays[band_name] = scaled_band.astype("float32")
+
+    valid_mask = (
+        valid_mask
+        & aoi_mask
+        & np.isfinite(band_arrays["green"])
+        & np.isfinite(band_arrays["swir16"])
     )
 
-    rgb = None
+    for band_name in band_arrays:
+        band_arrays[band_name][~valid_mask] = np.nan
 
-    if read_rgb:
-        rgb_assets = ["red", "green", "blue"]
-
-        if all(asset in signed_item.assets for asset in rgb_assets):
-            red_raw = read_cog_to_grid(
-                signed_item.assets["red"].href,
-                dst_crs,
-                dst_transform,
-                width,
-                height,
-                resampling_method=Resampling.bilinear
-            )
-
-            blue_raw = read_cog_to_grid(
-                signed_item.assets["blue"].href,
-                dst_crs,
-                dst_transform,
-                width,
-                height,
-                resampling_method=Resampling.bilinear
-            )
-
-            red_ref = scale_surface_reflectance(red_raw)
-            blue_ref = scale_surface_reflectance(blue_raw)
-
-            rgb = np.dstack([red_ref, green_ref, blue_ref]).astype("float32")
-            rgb[~valid_mask, :] = np.nan
+    ndsi = compute_ndsi(
+        green_reflectance=band_arrays["green"],
+        swir1_reflectance=band_arrays["swir16"],
+        valid_mask=valid_mask
+    )
 
     valid_pixels = int(np.sum(np.isfinite(ndsi) & aoi_mask))
 
@@ -622,12 +651,16 @@ def process_single_landsat_item(
         "platform": item.properties.get("platform", ""),
         "datetime": item.properties.get("datetime", ""),
         "cloud_cover": item.properties.get("eo:cloud_cover", None),
+        "bands": band_arrays,
         "ndsi": ndsi,
         "valid_mask": valid_mask,
-        "rgb": rgb,
         "valid_pixels": valid_pixels
     }
 
+
+# ================================================================
+# 9. Composite functions
+# ================================================================
 
 def composite_ndsi(scene_results, method="Median composite"):
     """
@@ -653,34 +686,53 @@ def composite_ndsi(scene_results, method="Median composite"):
     return composite
 
 
-def composite_rgb(scene_results, method="Median composite"):
+def composite_landsat_bands(scene_results, method="Median composite"):
     """
-    Composite RGB arrays for preview only.
+    Composite Landsat reflectance bands from processed scenes.
+
+    Returns:
+        Dictionary of composite bands:
+        blue, green, red, nir08, swir16, swir22
     """
-    rgb_list = [scene["rgb"] for scene in scene_results if scene["rgb"] is not None]
+    if len(scene_results) == 0:
+        raise ValueError("No scene results available for band compositing.")
 
-    if len(rgb_list) == 0:
-        return None
+    band_names = ["blue", "green", "red", "nir08", "swir16", "swir22"]
+    composite_bands = {}
 
-    rgb_stack = np.stack(rgb_list, axis=0)
+    for band_name in band_names:
+        band_stack = np.stack(
+            [
+                scene["bands"][band_name]
+                for scene in scene_results
+                if band_name in scene["bands"]
+            ],
+            axis=0
+        )
 
-    if method in ["Median composite", "Maximum NDSI composite"]:
-        rgb = np.nanmedian(rgb_stack, axis=0).astype("float32")
+        if method == "Best single scene":
+            composite = band_stack[0, :, :]
 
-    elif method == "Mean composite":
-        rgb = np.nanmean(rgb_stack, axis=0).astype("float32")
+        elif method == "Median composite":
+            composite = np.nanmedian(band_stack, axis=0)
 
-    elif method == "Best single scene":
-        rgb = rgb_list[0].astype("float32")
+        elif method == "Mean composite":
+            composite = np.nanmean(band_stack, axis=0)
 
-    else:
-        rgb = rgb_list[0].astype("float32")
+        elif method == "Maximum NDSI composite":
+            # For display, median reflectance is usually more stable than max.
+            composite = np.nanmedian(band_stack, axis=0)
 
-    return rgb
+        else:
+            composite = np.nanmedian(band_stack, axis=0)
+
+        composite_bands[band_name] = composite.astype("float32")
+
+    return composite_bands
 
 
 # ================================================================
-# 8. Histogram and threshold functions
+# 10. Histogram and threshold functions
 # ================================================================
 
 def calculate_histogram(ndsi_array, aoi_mask, bins=100):
@@ -759,7 +811,7 @@ def otsu_threshold_from_histogram(hist_df):
 
 
 # ================================================================
-# 9. Snow mask and area functions
+# 11. Snow mask and area functions
 # ================================================================
 
 def create_snow_mask(
@@ -830,7 +882,7 @@ def calculate_area_statistics(valid_mask, snow_bool, aoi_mask, resolution_m):
 
 
 # ================================================================
-# 10. Export functions
+# 12. Export functions
 # ================================================================
 
 def write_ndsi_geotiff(
@@ -930,12 +982,11 @@ def vectorize_snow_mask(
             )
 
     if len(records) == 0:
-        empty_gdf = gpd.GeoDataFrame(
-            {"snow": []},
-            geometry=[],
-            crs=dst_crs
-        )
-        empty_gdf.to_file(output_shapefile_path)
+        # Create a small text file if no snow polygon exists.
+        # Shapefile cannot reliably store a completely empty geometry layer in all environments.
+        no_snow_txt = output_shapefile_path.replace(".shp", "_NO_SNOW_POLYGONS.txt")
+        with open(no_snow_txt, "w", encoding="utf-8") as f:
+            f.write("No snow polygons were generated for the selected AOI and threshold.\n")
         return 0
 
     gdf = gpd.GeoDataFrame(records, crs=dst_crs)
@@ -944,7 +995,7 @@ def vectorize_snow_mask(
     gdf["area_km2"] = gdf.geometry.area / 1_000_000.0
 
     gdf = gdf.to_crs("EPSG:4326")
-    gdf.to_file(output_shapefile_path)
+    gdf.to_file(output_shapefile_path, driver="ESRI Shapefile")
 
     return len(gdf)
 
@@ -1009,18 +1060,19 @@ def export_all_outputs(
 
 
 # ================================================================
-# 11. Preview map functions
+# 13. Preview map functions
 # ================================================================
 
-def normalize_rgb(rgb_array, lower=2, upper=98):
+def normalize_rgb(rgb_array, lower=2, upper=98, gamma=1.0):
     """
-    Normalize RGB array for map preview.
+    Normalize a 3-band reflectance array for RGB visualization.
+
+    Uses percentile stretch for better display.
     """
     if rgb_array is None:
         return None
 
-    rgb = rgb_array.copy()
-
+    rgb = rgb_array.copy().astype("float32")
     output = np.zeros_like(rgb, dtype="float32")
 
     for i in range(3):
@@ -1035,11 +1087,20 @@ def normalize_rgb(rgb_array, lower=2, upper=98):
         if p_high <= p_low:
             continue
 
-        output[:, :, i] = (band - p_low) / (p_high - p_low)
+        stretched = (band - p_low) / (p_high - p_low)
+        stretched = np.clip(stretched, 0, 1)
 
-    output = np.clip(output, 0, 1)
+        if gamma != 1.0:
+            stretched = stretched ** (1.0 / gamma)
 
-    alpha = np.isfinite(rgb[:, :, 0]) & np.isfinite(rgb[:, :, 1]) & np.isfinite(rgb[:, :, 2])
+        output[:, :, i] = stretched
+
+    alpha = (
+        np.isfinite(rgb[:, :, 0])
+        & np.isfinite(rgb[:, :, 1])
+        & np.isfinite(rgb[:, :, 2])
+    )
+
     rgba = np.dstack(
         [
             output[:, :, 0],
@@ -1050,6 +1111,38 @@ def normalize_rgb(rgb_array, lower=2, upper=98):
     )
 
     return rgba
+
+
+def build_rgb_composite(composite_bands, selected_recipe):
+    """
+    Build RGB composite from selected Landsat band recipe.
+
+    Example:
+        NCC = red, green, blue
+        FCC = nir08, red, green
+    """
+    recipe = VISUALIZATION_RECIPES[selected_recipe]
+    band_names = recipe["bands"]
+
+    missing_bands = [
+        band for band in band_names
+        if band not in composite_bands
+    ]
+
+    if missing_bands:
+        raise ValueError(
+            f"Missing bands for selected composite: {', '.join(missing_bands)}"
+        )
+
+    rgb = np.dstack(
+        [
+            composite_bands[band_names[0]],
+            composite_bands[band_names[1]],
+            composite_bands[band_names[2]]
+        ]
+    ).astype("float32")
+
+    return rgb
 
 
 def ndsi_to_rgba(ndsi_array):
@@ -1063,9 +1156,9 @@ def ndsi_to_rgba(ndsi_array):
 
     rgba = np.zeros((ndsi_array.shape[0], ndsi_array.shape[1], 4), dtype="float32")
 
-    # Simple brown-yellow-blue gradient approximation
-    rgba[:, :, 0] = 1.0 - scaled * 0.7
-    rgba[:, :, 1] = 0.6 + scaled * 0.4
+    # Brown/yellow to blue-white style visualization
+    rgba[:, :, 0] = 1.0 - scaled * 0.55
+    rgba[:, :, 1] = 0.55 + scaled * 0.45
     rgba[:, :, 2] = scaled
     rgba[:, :, 3] = valid.astype("float32") * 0.75
 
@@ -1133,11 +1226,11 @@ def add_array_overlay_to_map(
 
 
 # ================================================================
-# 12. Sidebar inputs
+# 14. Sidebar inputs
 # ================================================================
 
 with st.sidebar:
-    st.header("1. AOI input")
+    st.header("1. AOI Input")
 
     uploaded_file = st.file_uploader(
         "Upload AOI shapefile ZIP / GeoJSON / GPKG",
@@ -1154,7 +1247,7 @@ with st.sidebar:
         help="Use only for very complex AOIs. 0 means no simplification."
     )
 
-    st.header("2. Landsat search")
+    st.header("2. Landsat Search")
 
     selected_platforms = st.multiselect(
         "Select Landsat sensors",
@@ -1235,7 +1328,7 @@ with st.sidebar:
         step=25
     )
 
-    st.header("4. Snow threshold")
+    st.header("4. Snow Threshold")
 
     threshold_mode = st.radio(
         "Threshold method",
@@ -1270,7 +1363,7 @@ with st.sidebar:
 
 
 # ================================================================
-# 13. AOI drawing/upload section
+# 15. AOI drawing / upload section
 # ================================================================
 
 uploaded_aoi_geojson = None
@@ -1329,7 +1422,7 @@ else:
 
 
 # ================================================================
-# 14. Main processing button
+# 16. Main processing
 # ================================================================
 
 process_button = st.button(
@@ -1415,8 +1508,7 @@ if process_button:
                     width=width,
                     height=height,
                     aoi_mask=aoi_mask,
-                    mask_water=mask_water,
-                    read_rgb=True
+                    mask_water=mask_water
                 )
 
                 if scene_result["valid_pixels"] > 0:
@@ -1433,13 +1525,13 @@ if process_button:
             st.error("No valid scenes could be processed inside AOI.")
             st.stop()
 
-        with st.spinner("Creating NDSI composite and snow mask..."):
+        with st.spinner("Creating NDSI composite, Landsat composites and snow mask..."):
             ndsi_composite = composite_ndsi(
                 scene_results=scene_results,
                 method=composite_method
             )
 
-            rgb_composite = composite_rgb(
+            landsat_band_composites = composite_landsat_bands(
                 scene_results=scene_results,
                 method=composite_method
             )
@@ -1493,7 +1585,7 @@ if process_button:
             "height": height,
             "aoi_mask": aoi_mask,
             "ndsi": ndsi_composite,
-            "rgb": rgb_composite,
+            "landsat_bands": landsat_band_composites,
             "hist_df": hist_df,
             "otsu_threshold": otsu_threshold,
             "final_threshold": final_threshold,
@@ -1512,7 +1604,7 @@ if process_button:
 
 
 # ================================================================
-# 15. Results display
+# 17. Results display
 # ================================================================
 
 if "snow_result" in st.session_state:
@@ -1598,7 +1690,70 @@ if "snow_result" in st.session_state:
         use_container_width=True
     )
 
+    # ============================================================
+    # Step 5: Map Preview with Composite Selector
+    # ============================================================
+
     st.subheader("Step 5: Map Preview")
+
+    st.markdown(
+        """
+        Select the Landsat visualization composite you want to display.
+        You can also overlay the NDSI layer and the final snow mask.
+        """
+    )
+
+    map_col1, map_col2, map_col3 = st.columns([2, 1, 1])
+
+    with map_col1:
+        selected_composite = st.selectbox(
+            "Select Landsat visualization",
+            options=list(VISUALIZATION_RECIPES.keys()),
+            index=0
+        )
+
+    with map_col2:
+        show_ndsi_layer = st.checkbox(
+            "Show NDSI layer",
+            value=False
+        )
+
+    with map_col3:
+        show_snow_layer = st.checkbox(
+            "Show snow mask",
+            value=True
+        )
+
+    st.info(VISUALIZATION_RECIPES[selected_composite]["description"])
+
+    stretch_col1, stretch_col2, stretch_col3 = st.columns(3)
+
+    with stretch_col1:
+        lower_percentile = st.slider(
+            "Lower stretch percentile",
+            min_value=0,
+            max_value=10,
+            value=2,
+            step=1
+        )
+
+    with stretch_col2:
+        upper_percentile = st.slider(
+            "Upper stretch percentile",
+            min_value=90,
+            max_value=100,
+            value=98,
+            step=1
+        )
+
+    with stretch_col3:
+        gamma_value = st.slider(
+            "Gamma",
+            min_value=0.5,
+            max_value=2.5,
+            value=1.0,
+            step=0.1
+        )
 
     preview_map = make_base_map(result["aoi_geojson"])
 
@@ -1609,37 +1764,55 @@ if "snow_result" in st.session_state:
         height=result["height"]
     )
 
-    rgb_rgba = normalize_rgb(result["rgb"])
-    ndsi_rgba = ndsi_to_rgba(result["ndsi"])
-    snow_rgba = snow_to_rgba(result["snow_mask"])
+    try:
+        selected_rgb = build_rgb_composite(
+            composite_bands=result["landsat_bands"],
+            selected_recipe=selected_composite
+        )
 
-    if rgb_rgba is not None:
+        selected_rgba = normalize_rgb(
+            rgb_array=selected_rgb,
+            lower=lower_percentile,
+            upper=upper_percentile,
+            gamma=gamma_value
+        )
+
+        if selected_rgba is not None:
+            add_array_overlay_to_map(
+                fmap=preview_map,
+                array_rgba=selected_rgba,
+                bounds=bounds_4326,
+                name=selected_composite,
+                opacity=1.0,
+                show=True
+            )
+
+    except Exception as e:
+        st.warning(f"Could not display selected composite: {e}")
+
+    if show_ndsi_layer:
+        ndsi_rgba = ndsi_to_rgba(result["ndsi"])
+
         add_array_overlay_to_map(
             fmap=preview_map,
-            array_rgba=rgb_rgba,
+            array_rgba=ndsi_rgba,
             bounds=bounds_4326,
-            name="Landsat RGB Preview",
-            opacity=1.0,
+            name="NDSI",
+            opacity=0.75,
             show=True
         )
 
-    add_array_overlay_to_map(
-        fmap=preview_map,
-        array_rgba=ndsi_rgba,
-        bounds=bounds_4326,
-        name="NDSI Preview",
-        opacity=0.75,
-        show=False
-    )
+    if show_snow_layer:
+        snow_rgba = snow_to_rgba(result["snow_mask"])
 
-    add_array_overlay_to_map(
-        fmap=preview_map,
-        array_rgba=snow_rgba,
-        bounds=bounds_4326,
-        name="Snow Mask",
-        opacity=0.85,
-        show=True
-    )
+        add_array_overlay_to_map(
+            fmap=preview_map,
+            array_rgba=snow_rgba,
+            bounds=bounds_4326,
+            name="Snow Mask",
+            opacity=0.85,
+            show=True
+        )
 
     folium.GeoJson(
         result["aoi_geojson"],
@@ -1660,6 +1833,10 @@ if "snow_result" in st.session_state:
         use_container_width=True
     )
 
+    # ============================================================
+    # Step 6: Export
+    # ============================================================
+
     st.subheader("Step 6: Export GeoTIFF and Shapefile")
 
     st.markdown(
@@ -1668,7 +1845,7 @@ if "snow_result" in st.session_state:
 
         1. NDSI GeoTIFF  
         2. Snow mask GeoTIFF  
-        3. Snow polygon shapefile  
+        3. Snow polygon shapefile, if snow polygons are detected  
         4. All shapefile sidecar files zipped together  
         """
     )
@@ -1676,7 +1853,7 @@ if "snow_result" in st.session_state:
     if st.button("Generate Export Files", type="primary"):
 
         try:
-            with st.spinner("Writing GeoTIFF and Shapefile outputs..."):
+            with st.spinner("Writing GeoTIFF and shapefile outputs..."):
                 export_result = export_all_outputs(
                     ndsi_array=result["ndsi"],
                     snow_mask=result["snow_mask"],
